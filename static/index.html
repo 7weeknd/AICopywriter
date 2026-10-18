@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AICopywriter · 多任务文本生成</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#fff; --line:#e6e8ec; --text:#1f2430; --muted:#7b8394;
+    --brand:#2f6feb; --ok:#1a9d63; --err:#d64545; --radius:12px;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  header{max-width:1080px;margin:0 auto;padding:28px 24px 0}
+  header h1{margin:0;font-size:22px}
+  header p{margin:4px 0 0;color:var(--muted)}
+  .tabs{max-width:1080px;margin:16px auto 0;padding:0 24px;display:flex;gap:8px;flex-wrap:wrap}
+  .tab{padding:8px 14px;border:1px solid var(--line);background:#fff;
+       border-radius:999px;cursor:pointer;color:var(--muted);font:inherit}
+  .tab.active{border-color:var(--brand);color:var(--brand);font-weight:600;background:#eef4ff}
+  main{max-width:1080px;margin:16px auto;padding:0 24px;
+       display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:900px){main{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+        padding:18px;max-width:1080px;margin:16px auto}
+  main .card{margin:0;max-width:none}
+  .card h2{margin:0 0 10px;font-size:15px}
+  label{display:block;margin:12px 0 6px;font-size:13px;font-weight:600}
+  input[type=text],textarea,select{width:100%;padding:9px 11px;border:1px solid var(--line);
+        border-radius:8px;font:inherit;background:#fff;color:inherit}
+  textarea{resize:vertical}
+  textarea,pre{font-family:ui-monospace,Consolas,"Courier New",monospace}
+  .actions{display:flex;align-items:center;gap:10px;margin-top:14px;flex-wrap:wrap}
+  button{padding:9px 16px;border-radius:8px;border:1px solid var(--line);
+         background:#fff;cursor:pointer;font:inherit}
+  button.primary{background:var(--brand);border-color:var(--brand);color:#fff;font-weight:600}
+  button.primary:disabled{opacity:.55;cursor:not-allowed}
+  button.ghost{color:var(--muted)}
+  .result{white-space:pre-wrap;min-height:170px;padding:12px;
+          border:1px dashed var(--line);border-radius:8px;background:#fbfcfe}
+  .muted{color:var(--muted);font-size:13px}
+  .status{margin-top:10px;font-size:13px}
+  .status.ok{color:var(--ok)}
+  .status.err{color:var(--err)}
+  .history{list-style:none;padding:0;margin:0}
+  .history li{border-top:1px solid var(--line);padding:12px 0}
+  .history li:first-child{border-top:none}
+  .history .meta{display:flex;gap:10px;align-items:center;color:var(--muted);font-size:12px}
+  .history .meta .del{margin-left:auto;cursor:pointer;color:var(--err)}
+  .history .body{white-space:pre-wrap;margin-top:6px}
+  pre{background:#fbfcfe;border:1px solid var(--line);border-radius:8px;
+      padding:12px;overflow:auto;white-space:pre-wrap}
+  details summary{cursor:pointer;color:var(--muted);font-size:13px;margin-top:12px}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>AICopywriter</h1>
+  <p>多任务文本生成服务 · 提示词模板可配置 · 数据全程落在本地 MySQL</p>
+</header>
+
+<nav class="tabs" id="taskTabs"></nav>
+
+<main>
+  <section class="card">
+    <h2 id="taskName">加载中…</h2>
+    <p class="muted" id="taskDesc"></p>
+    <form id="genForm"></form>
+    <div class="actions">
+      <button class="primary" id="btnGenerate">生成</button>
+      <button class="ghost" id="btnPreview">预览提示词</button>
+    </div>
+    <div class="status" id="status"></div>
+  </section>
+
+  <section class="card">
+    <h2>生成结果</h2>
+    <div class="result" id="result">还没有结果，先在左侧填参数点「生成」。</div>
+    <div class="actions">
+      <button class="ghost" id="btnCopy">复制结果</button>
+      <span class="muted" id="latency"></span>
+    </div>
+    <details>
+      <summary>查看最终发给大模型的提示词</summary>
+      <pre id="previewBox">点「预览提示词」后显示在这里。</pre>
+    </details>
+  </section>
+</main>
+
+<section class="card">
+  <h2>提示词模板 <span class="muted" id="tplTask"></span></h2>
+  <label for="tplSystem">System 提示词</label>
+  <textarea id="tplSystem" rows="4"></textarea>
+  <label for="tplUser">User 模板（用 <code>{字段名}</code> 占位）</label>
+  <textarea id="tplUser" rows="5"></textarea>
+  <label for="tplTemp">Temperature：<span id="tplTempVal">0.8</span></label>
+  <input type="range" id="tplTemp" min="0" max="2" step="0.1" value="0.8">
+  <div class="actions">
+    <button class="primary" id="btnSaveTpl">保存模板</button>
+    <span class="status" id="tplStatus"></span>
+  </div>
+</section>
+
+<section class="card">
+  <h2>生成历史</h2>
+  <ul class="history" id="history"><li class="muted">加载中…</li></ul>
+</section>
+
+<script>
+// ---- 小工具 ----
+const $ = (id) => document.getElementById(id);
+
+async function api(path, options) {
+  const resp = await fetch(path, options);
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data.detail || ("请求失败：" + resp.status));
+  return data;
+}
+
+function setStatus(msg, type) {
+  const el = $("status");
+  el.textContent = msg;
+  el.className = "status " + (type || "");
+}
+
+// ---- 全局状态：任务列表 + 当前任务 ----
+let tasks = [];
+let current = null;
+
+// ---- 加载任务，渲染标签页 ----
+async function loadTasks() {
+  tasks = await api("/api/tasks");
+  const tabs = $("taskTabs");
+  tabs.innerHTML = "";
+  tasks.forEach((t) => {
+    const btn = document.createElement("button");
+    btn.className = "tab";
+    btn.textContent = t.name;
+    btn.dataset.task = t.task;
+    btn.onclick = () => selectTask(t.task);
+    tabs.appendChild(btn);
+  });
+  if (tasks.length) selectTask(tasks[0].task);
+}
+
+function selectTask(task) {
+  current = tasks.find((t) => t.task === task);
+  document.querySelectorAll(".tab").forEach((el) => {
+    el.classList.toggle("active", el.dataset.task === task);
+  });
+  $("taskName").textContent = current.name;
+  $("taskDesc").textContent = current.description || "";
+  renderForm(current);
+  fillTemplate(current);
+  setStatus("");
+}
+
+// ---- 依据后端返回的 fields 元数据动态渲染表单 ----
+function renderForm(tpl) {
+  const form = $("genForm");
+  form.innerHTML = "";
+  tpl.fields.forEach((f) => {
+    const label = document.createElement("label");
+    label.textContent = f.label + (f.required ? " *" : "");
+    form.appendChild(label);
+
+    let el;
+    if (f.type === "textarea") {
+      el = document.createElement("textarea");
+      el.rows = 6;
+    } else if (f.type === "select") {
+      el = document.createElement("select");
+      (f.options || []).forEach((o) => {
+        const opt = document.createElement("option");
+        opt.value = o.value;
+        opt.textContent = o.label;
+        el.appendChild(opt);
+      });
+      if (f.default) el.value = f.default;
+    } else {
+      el = document.createElement("input");
+      el.type = "text";
+    }
+    if (f.placeholder) el.placeholder = f.placeholder;
+    el.id = "field-" + f.name;
+    form.appendChild(el);
+  });
+}
+
+function collectParams() {
+  const params = {};
+  current.fields.forEach((f) => {
+    const el = $("field-" + f.name);
+    if (el) params[f.name] = el.value;
+  });
+  return params;
+}
+
+function payload() {
+  return JSON.stringify({ task: current.task, params: collectParams() });
+}
+
+// ---- 生成 / 预览 / 复制 ----
+async function doGenerate() {
+  $("btnGenerate").disabled = true;
+  setStatus("生成中…");
+  try {
+    const res = await api("/api/generate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: payload(),
+    });
+    $("result").textContent = res.content;
+    $("latency").textContent = "耗时 " + res.latency_ms + " ms";
+    setStatus("生成成功，已写入历史", "ok");
+    loadHistory();
+  } catch (e) {
+    setStatus(e.message, "err");
+  } finally {
+    $("btnGenerate").disabled = false;
+  }
+}
+
+async function doPreview() {
+  try {
+    const res = await api("/api/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: payload(),
+    });
+    $("previewBox").textContent =
+      "【system】\n" + res.system_prompt + "\n\n【user】\n" + res.user_prompt;
+    setStatus("提示词已渲染，展开下方查看", "ok");
+  } catch (e) {
+    setStatus(e.message, "err");
+  }
+}
+
+$("btnCopy").onclick = async () => {
+  const text = $("result").textContent;
+  if (!text) return;
+  await navigator.clipboard.writeText(text);
+  setStatus("已复制到剪贴板", "ok");
+};
+
+// ---- 模板编辑 ----
+function fillTemplate(tpl) {
+  $("tplTask").textContent = "（" + tpl.task + (tpl.builtin ? " · 内置" : " · 自定义") + "）";
+  $("tplSystem").value = tpl.system_prompt;
+  $("tplUser").value = tpl.user_template;
+  $("tplTemp").value = tpl.temperature;
+  $("tplTempVal").textContent = tpl.temperature;
+}
+
+$("tplTemp").oninput = () => { $("tplTempVal").textContent = $("tplTemp").value; };
+
+$("btnSaveTpl").onclick = async () => {
+  const el = $("tplStatus");
+  try {
+    const updated = await api("/api/templates/" + current.task, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        system_prompt: $("tplSystem").value,
+        user_template: $("tplUser").value,
+        temperature: parseFloat($("tplTemp").value),
+      }),
+    });
+    Object.assign(current, updated); // 同步本地状态，标签页与表单保持一致
+    el.textContent = "模板已保存，下一次生成立即生效";
+    el.className = "status ok";
+  } catch (e) {
+    el.textContent = e.message;
+    el.className = "status err";
+  }
+};
+
+// ---- 历史 ----
+async function loadHistory() {
+  let rows = [];
+  try {
+    rows = await api("/api/history?limit=20");
+  } catch (e) {
+    $("history").innerHTML = '<li class="muted">历史加载失败</li>';
+    return;
+  }
+  const ul = $("history");
+  ul.innerHTML = "";
+  if (!rows.length) {
+    ul.innerHTML = '<li class="muted">暂无记录</li>';
+    return;
+  }
+  rows.forEach((r) => {
+    const li = document.createElement("li");
+
+    const meta = document.createElement("div");
+    meta.className = "meta";
+    ["#" + r.id, r.task, r.latency_ms + " ms", r.created_at].forEach((t) => {
+      const span = document.createElement("span");
+      span.textContent = t;
+      meta.appendChild(span);
+    });
+    const del = document.createElement("span");
+    del.className = "del";
+    del.textContent = "删除";
+    del.onclick = async () => {
+      await fetch("/api/history/" + r.id, { method: "DELETE" });
+      loadHistory();
+    };
+    meta.appendChild(del);
+
+    const body = document.createElement("div");
+    body.className = "body";
+    body.textContent = r.content;
+
+    li.appendChild(meta);
+    li.appendChild(body);
+    ul.appendChild(li);
+  });
+}
+
+// ---- 初始化 ----
+$("btnGenerate").onclick = doGenerate;
+$("btnPreview").onclick = doPreview;
+
+(async () => {
+  try {
+    await loadTasks();
+    await loadHistory();
+  } catch (e) {
+    setStatus(e.message, "err");
+  }
+})();
+</script>
+</body>
+</html>
